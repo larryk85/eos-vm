@@ -3,12 +3,15 @@
 #include <eosio/vm/constants.hpp>
 #include <eosio/vm/exceptions.hpp>
 
+#include <array>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/mman.h>
@@ -142,8 +145,12 @@ namespace eosio { namespace vm {
          page = 0;
       }
       void reset() {
-         mprotect(raw, page_size * page, PROT_NONE);
+	 memset(raw, '\0', page_size*page); // zero the memory
+         mprotect(raw, page_size * page, PROT_NONE); // protect the entire region of memory
          page = 0;
+      }
+      bool clean()const {
+         return page == 0;
       }
       template <typename T>
       inline T* get_base_ptr() const {
@@ -151,5 +158,39 @@ namespace eosio { namespace vm {
       }
       inline int32_t get_current_page() const { return page; }
       bool is_in_region(char* p) { return p >= raw && p < raw + max_memory; }
+   };
+
+   class buffered_allocator {
+      public:
+         buffered_allocator() {
+            _allocator_cleaner.join();
+         }
+         wasm_allocator& get_clean_allocator() {
+            // block until we get the mutex
+            _allocator_mtx[_which].lock();            
+            ++_which %= 2;
+            return _allocators[_which];
+         }
+         void release_allocator(wasm_allocator& alloc) {
+            // invalidate the allocator for cleaning
+            _allocator_mtx[(&alloc == &_allocators[_which]) ? _which : (_which+1) % 2].unlock();
+         }
+      private:
+         void clean_allocators() {
+            uint8_t which = _which;
+            while (1) {
+               // lock the allocator for cleaning
+               if (!_allocators[which].clean() && _allocator_mtx[which].try_lock()) {
+                  auto& alloc = _allocators[which];
+                  alloc.reset();
+                  _allocator_mtx[which].unlock();
+               }
+               ++which %= 2;
+            }
+         }
+         std::thread _allocator_cleaner = std::thread(&buffered_allocator::clean_allocators, this);
+         std::array<wasm_allocator, 2> _allocators;
+         std::array<std::mutex, 2>     _allocator_mtx;
+         uint8_t                       _which = 0;
    };
 }} // namespace eosio::vm
